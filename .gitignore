@@ -1,0 +1,11 @@
+# VS Code
+.vscode
+
+# Python
+__pycache__
+
+# Wandb
+wandb/
+
+# dataset
+dataset/
