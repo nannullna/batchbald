@@ -95,7 +95,7 @@ def main(args):
     init_samples = init_sampler()
     pool.update(init_samples)
 
-    run_summary = {"state": [], "train_acc": [], "test_acc": [], "query_length": [], "query_time": []}
+    run_summary = {"stage": [], "train_acc": [], "test_acc": [], "query_length": [], "query_time": []}
 
     for stage in range(num_stages):
         
