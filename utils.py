@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -11,7 +11,7 @@ class QueryResult:
     scores: List[float]
     indices: List[int]
     labels: List[int] = field(init=False)
-    info: Optional[Dict] = None
+    info: Dict[str, Any] = field(default_factory=dict)
 
     def __repr__(self):
         return f"[QueryResult] length {len(self.indices)}."

@@ -2,6 +2,7 @@ from abc import abstractmethod
 from typing import Optional, Union, List, Dict
 from dataclasses import dataclass, field
 import gc
+import time
 
 import numpy as np
 
@@ -25,15 +26,21 @@ class ActiveQuery:
     def __call__(self, size: Optional[int]=None) -> QueryResult:
         size = size or self.size
         remainings = len(self.pool.unlabeled_data)
-        if remainings == 0:
-            return QueryResult(scores=[], indices=[])
+        start = time.time()
+        
+        if remainings == 0 or size == 0:
+            result = QueryResult(scores=[], indices=[])
         elif remainings < size:
-            return QueryResult(
+            result = QueryResult(
                 scores=[1] * remainings, 
                 indices=list(range(remainings)),
             )
         else:
-            return self.query(size)
+            result = self.query(size)
+
+        end = time.time()
+        result.info.update({"method": self.__class__.__name__, "time": end-start})
+        return result
 
     @abstractmethod
     def query(self, size: int) -> QueryResult:
