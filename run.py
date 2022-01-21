@@ -34,7 +34,7 @@ import wandb
 from tqdm.auto import tqdm
 
 from pool import ActivePool
-from methods import RandomSampling, UncertaintySampling, MarginSampling
+from methods import BALD, ActiveQuery, EntropySampling, RandomSampling, UncertaintySampling, MarginSampling
 from models import MNISTCNN
 
 def load_dataset(name: str):
@@ -66,7 +66,7 @@ def load_dataset(name: str):
     return train_set, test_set
 
 def get_model(num_classes:int):
-    model = timm.create_model("resnet50", pretrained=False, num_classes=num_classes)
+    model = timm.create_model("resnet18", pretrained=False, num_classes=num_classes)
     return model
 
 def get_sampler(name: str):
@@ -76,6 +76,10 @@ def get_sampler(name: str):
         return UncertaintySampling
     elif name.lower() == "margin":
         return MarginSampling
+    elif name.lower() == "entropy":
+        return EntropySampling
+    elif name.lower() == "bald":
+        return BALD
 
 def main(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu") 
@@ -88,9 +92,9 @@ def main(args):
     num_stages = int(len(train_set) * (1-args.initial_label_rate)) // args.query_size
     max_steps  = (len(train_set) // args.batch_size) * args.max_epochs
 
-    pool  = ActivePool(train_set, batch_size=args.batch_size)
+    pool = ActivePool(train_set, batch_size=args.batch_size)
     init_sampler = RandomSampling(None, pool, int(len(train_set)*args.initial_label_rate))
-    sampler = get_sampler(args.query_type)(None, pool, args.query_size)
+    sampler = get_sampler(args.query_type)(None, pool, size=args.query_size)
 
     init_samples = init_sampler()
     pool.update(init_samples)
