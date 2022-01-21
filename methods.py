@@ -175,7 +175,7 @@ class BALD(ActiveQuery):
             mean_prob = torch.mean(x, dim=1)
             entry = mean_prob * torch.log(mean_prob)
             entry[mean_prob == 0.0] = 0.0
-        entropy = -torch.sum(x, dim=1, keepdim=keepdim)
+        entropy = -torch.sum(entry, dim=1, keepdim=keepdim)
         return entropy
 
     @staticmethod
@@ -204,18 +204,19 @@ class BALD(ActiveQuery):
         with torch.no_grad():
             for X, _ in dataloader:
                 B = X.size(0)
-                ndim = X.ndim
+                in_shape = list(X.shape)[1:]
 
                 # create batch input
                 X = X.to(device).unsqueeze(1) # [B, ...]
-                X = X.expand([-1, self.K] + [-1] * (ndim-1)).contiguous() # [B, K, ...]
-                X = X.view([B*self.K] + [-1]*(ndim-1)) # [B*K, ...]
+                X = X.expand([-1, self.K] + in_shape).contiguous() # [B, K, ...]
+                X = X.view([B*self.K] + in_shape) # [B*K, ...]
 
                 out = self.model(X)
+                out_shape = list(out.shape)[1:]
                 logits = torch.log_softmax(out, dim=1)
-                logits = logits.view([B, self.K] + [-1]*(ndim-1))
+                logits = logits.view([B, self.K] + out_shape)
 
-                score = self.calc_entropy(out, log_p=True) - self.calc_conditional_entropy(out, log_p=True)
+                score = self.calc_entropy(logits, log_p=True) - self.calc_conditional_entropy(logits, log_p=True)
                 all_scores.extend(score.detach().cpu().tolist())
 
         return self.get_query_from_scores(all_scores, size=size)
