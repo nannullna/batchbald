@@ -198,7 +198,7 @@ class BALD(ActiveQuery):
         dataloader = self.pool.get_unlabeled_dataloader(batch_size=_batch_size)
         all_scores = []
 
-        device = self.device if self.device is not None else torch.device("cuda")
+        device = self.device if self.device is not None else torch.device("cuda:1")
 
         self.model.train()
         with torch.no_grad():
