@@ -85,6 +85,7 @@ def main(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu") 
 
     train_set, test_set = load_dataset(args.dataset)
+    test_dl = DataLoader(test_set, batch_size=1024, shuffle=False)
     
     TRAIN_ACC = []
     TEST_ACC  = []
@@ -103,8 +104,8 @@ def main(args):
 
     for stage in range(num_stages):
         
-        train_dl = pool.get_labeled_dataloader()
-        eval_dl  = pool.get_unlabeled_dataloader()
+        labeled_dl = pool.get_labeled_dataloader()
+        unlabeled_dl  = pool.get_unlabeled_dataloader()
 
         model = get_model(num_classes=len(train_set.classes)).to(device)
         sampler.update_model(model)
@@ -115,12 +116,13 @@ def main(args):
         steps = 0
         training = True
 
+        pbar = tqdm(total=max_steps, desc="Train on labeled pool")
         while training:
             all_targets = []
             all_preds   = []
 
             model.train()
-            for X, y in tqdm(train_dl, desc="train on labeled set"):
+            for X, y in labeled_dl:
                 optimizer.zero_grad()
 
                 X = X.to(device)
@@ -136,6 +138,7 @@ def main(args):
                 all_targets.extend(y.detach().cpu().tolist())
 
                 steps += 1
+                pbar.update(1)
                 if steps > max_steps:
                     training = False
                     break
@@ -147,6 +150,7 @@ def main(args):
             if acc > args.early_stopping_threshold:
                 print(f"Early stopped at epoch {epochs+1} with accuracy score {acc:.3f}")
                 break
+        pbar.close()
 
         print(f"Stage {stage} Train accuracy: {acc:.3f}", end=" ")
         run_summary["stage"].append(stage)
@@ -157,7 +161,7 @@ def main(args):
 
         model.eval()
         with torch.no_grad():
-            for X, y in tqdm(eval_dl, desc="evaluation on test set"):
+            for X, y in tqdm(test_dl, desc="Evaluate on test set"):
                 X = X.to(device)
                 y = y.to(device)
 
@@ -173,11 +177,19 @@ def main(args):
         print(f"Test accuracy: {acc:.3f}")
         run_summary["test_acc"].append(acc)
 
+        print("Query on unlabeled pool")
         result = sampler()
+
+        # TODO: analyze the pooled indices
+        all_targets = np.asarray(all_targets)
+        pool_targets = all_targets[result.indices]
+
         pool.update(result)
         print(f"Labeled pool updated with size {len(result.indices)}, time consumed {result.info['time']:.1f}s")
         run_summary["query_length"].append(len(result.indices))
         run_summary["query_time"].append(result.info["time"])
+
+        
 
         wandb.log({k: v[-1] for k, v in run_summary.items()})
 
