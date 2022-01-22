@@ -63,10 +63,10 @@ class ActiveQuery:
         self.model = model
 
     @staticmethod
-    def get_query_from_scores(scores: Union[Sequence[float], Sequence[int]], size: int, return_list: bool=False):
+    def get_query_from_scores(scores: Union[Sequence[float], Sequence[int]], size: int, higher_is_better: bool = False, return_list: bool=False):
         scores  = np.asarray(scores, dtype=np.float32)
-        indices = scores.argsort()[:size]
-        scores  = np.sort(scores)[:size]
+        indices = scores.argsort()[-size:] if higher_is_better else scores.argsort()[:size]
+        scores  = np.sort(scores)[-size:]  if higher_is_better else np.sort(scores)[:size]
         if return_list:
             return QueryResult(indices=indices.tolist(), scores=scores.tolist())
         else:
@@ -85,7 +85,7 @@ class UncertaintySampling(ActiveQuery):
         dataloader = self.pool.get_unlabeled_dataloader(shuffle=False)
         all_scores = []
 
-        device = self.device if self.device is not None else torch.device("cuda")
+        device = self.device or torch.device("cuda")
 
         self.model.eval()
         with torch.no_grad():
@@ -96,14 +96,15 @@ class UncertaintySampling(ActiveQuery):
                 score, pred = torch.max(out, dim=1)
                 all_scores.extend(score.detach().cpu().tolist())
 
-        return self.get_query_from_scores(all_scores, size=size)
+        # returns the query with the k least confident probability
+        return self.get_query_from_scores(all_scores, size=size, higher_is_better=False)
 
 class MarginSampling(ActiveQuery):
     def _query_impl(self, size: int, **kwargs) -> QueryResult:
         dataloader = self.pool.get_unlabeled_dataloader(shuffle=False)
         all_scores = []
 
-        device = self.device if self.device is not None else torch.device("cuda")
+        device = self.device or torch.device("cuda")
 
         self.model.eval()
         with torch.no_grad():
@@ -117,7 +118,8 @@ class MarginSampling(ActiveQuery):
                 pred = ids[:, 0]
                 all_scores.extend(score.detach().cpu().tolist())
 
-        return self.get_query_from_scores(all_scores, size=size)
+        # returns the query with the k smallest margins
+        return self.get_query_from_scores(all_scores, size=size, higher_is_better=False)
 
 class EntropySampling(ActiveQuery):
 
@@ -135,7 +137,7 @@ class EntropySampling(ActiveQuery):
         dataloader = self.pool.get_unlabeled_dataloader(shuffle=False)
         all_scores = []
 
-        device = self.device if self.device is not None else torch.device("cuda")
+        device = self.device or torch.device("cuda")
 
         self.model.eval()
         with torch.no_grad():
@@ -147,7 +149,8 @@ class EntropySampling(ActiveQuery):
                 score = self.calc_entropy(logits, log_p=True)
                 all_scores.extend(score.detach().cpu().tolist())
         
-        return self.get_query_from_scores(all_scores, size=size)
+        # returns the query with the k highest entropies
+        return self.get_query_from_scores(all_scores, size=size, higher_is_better=True)
 
 class BALD(ActiveQuery):
 
@@ -198,7 +201,7 @@ class BALD(ActiveQuery):
         dataloader = self.pool.get_unlabeled_dataloader(batch_size=_batch_size)
         all_scores = []
 
-        device = self.device if self.device is not None else torch.device("cuda:1")
+        device = self.device or torch.device("cuda")
 
         self.model.train()
         with torch.no_grad():
@@ -219,4 +222,4 @@ class BALD(ActiveQuery):
                 score = self.calc_entropy(logits, log_p=True) - self.calc_conditional_entropy(logits, log_p=True)
                 all_scores.extend(score.detach().cpu().tolist())
 
-        return self.get_query_from_scores(all_scores, size=size)
+        return self.get_query_from_scores(all_scores, size=size, higher_is_better=True)

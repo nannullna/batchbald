@@ -9,3 +9,9 @@ wandb/
 
 # dataset
 dataset/
+
+# saved models and logs
+saved/
+logging/
+nohup.out
+log.txt

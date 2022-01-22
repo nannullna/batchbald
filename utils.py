@@ -1,8 +1,8 @@
 from typing import Any, List, Optional, Dict
 from dataclasses import dataclass, field
+import random
 
 import numpy as np
-
 import torch
 
 @dataclass
@@ -24,3 +24,14 @@ class QueryResult:
             raise ValueError("The length of the query and that of the labels provided do not match.")
         self.labels = list(labels)
 
+def set_all_seeds(seed, verbose=False):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(seed)
+    random.seed(seed)
+
+    if verbose:
+        print("All random seeds set to", seed)
