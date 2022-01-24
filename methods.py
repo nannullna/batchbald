@@ -249,47 +249,14 @@ class BALD(ActiveQuery):
         return self.get_query_from_scores(all_scores, size=size, higher_is_better=True)
 
 
+# TODO
 class BatchBALD(ActiveQuery):
+    pass
 
-    def __init__(self, model: nn.Module, pool: ActivePool, num_samples: int = 10, size: int = 1, device: torch.device = None):
-        super().__init__(model, pool, size, device)
-        if isinstance(model, nn.Module):
-            # safety check here!
-            self.model.global_pool.register_forward_hook(lambda m, i, out: torch.dropout(out, p=0.5, training=True))
-        self.K = num_samples
+# TODO
+class GradientSampling(ActiveQuery):
+    pass
 
-    def update_model(self, model: nn.Module):
-        super().update_model(model)
-        # add dropout right before the final layer
-        self.model.global_pool.register_forward_hook(lambda m, i, out: torch.dropout(out, p=0.5, train=True))
-
-    def _query_impl(self, size: int, **kwargs) -> QueryResult:
-
-        _batch_size = self.pool.batch_size//self.K
-        _batch_size = 2**(math.ceil(math.log(_batch_size, 2)))
-
-        dataloader = self.pool.get_unlabeled_dataloader(batch_size=_batch_size)
-        all_scores = []
-
-        device = self.device or torch.device("cuda")
-
-        self.model.train()
-        with torch.no_grad():
-            for X, _ in tqdm(dataloader):
-                B = X.size(0)
-                in_shape = list(X.shape)[1:]
-
-                # create batch input
-                X = X.to(device).unsqueeze(1) # [B, ...]
-                X = X.expand([-1, self.K] + in_shape).contiguous() # [B, K, ...]
-                X = X.view([B*self.K] + in_shape) # [B*K, ...]
-
-                out = self.model(X)
-                out_shape = list(out.shape)[1:]
-                log_prob = torch.log_softmax(out, dim=1)
-                log_prob = log_prob.view([B, self.K] + out_shape)
-
-                score = self.calc_entropy(log_prob, log_p=True) - self.calc_conditional_entropy(log_prob, log_p=True)
-                all_scores.extend(score.detach().cpu().tolist())
-
-        return super()._query_impl(size, **kwargs)
+# TODO
+class AdaptiveGradientSampling(ActiveQuery):
+    pass
