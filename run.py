@@ -150,7 +150,7 @@ def main(args):
         logger.info(f"Start stage {stage}")
         run_summary = {"stage": stage}
         
-        num_acquired_points = len(pool.get_labeled_ids)
+        num_acquired_points = len(pool.get_labeled_ids())
         labeled_dl = pool.get_labeled_dataloader()
 
         model = get_model(num_classes=num_classes).to(device)
