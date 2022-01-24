@@ -168,6 +168,7 @@ def main(args):
         while training:
             all_targets = []
             all_preds   = []
+            all_losses  = []
 
             model.train()
             for X, y in labeled_dl:
@@ -184,6 +185,7 @@ def main(args):
                 pred = torch.argmax(out, dim=1)
                 all_preds.extend(pred.tolist())
                 all_targets.extend(y.detach().cpu().tolist())
+                all_losses.append(loss.item())
 
                 steps += 1
                 pbar.update(1)
@@ -192,6 +194,7 @@ def main(args):
                     break
             
             acc = accuracy_score(all_targets, all_preds)
+            loss = np.mean(all_losses)
 
             epochs += 1
             if acc > args.early_stopping_threshold:
@@ -199,12 +202,13 @@ def main(args):
                 break
         pbar.close()
         
-        train_stats = {"train/accuracy": acc, "train/epochs": epochs, "train/steps": steps}
+        train_stats = {"train/accuracy": acc, "train/epochs": epochs, "train/steps": steps, "train/loss": loss}
         log_metrics("train", train_stats, global_stage=stage, num_acquired=num_acquired_points)
         run_summary.update(train_stats)
         
         all_targets = []
         all_preds = []
+        all_losses  = []
 
         model.eval()
         with torch.no_grad():
@@ -218,10 +222,12 @@ def main(args):
                 pred = torch.argmax(out, dim=1)
                 all_preds.extend(pred.tolist())
                 all_targets.extend(y.detach().cpu().tolist())
+                all_losses.append(loss.item())
         
         acc = accuracy_score(all_targets, all_preds)
+        loss = np.mean(all_losses)
         
-        test_stats = {"test/accuracy": acc}
+        test_stats = {"test/accuracy": acc, "test/loss": loss}
         run_summary.update(test_stats)
         log_metrics("test", test_stats, global_stage=stage, num_acquired=num_acquired_points)
 
