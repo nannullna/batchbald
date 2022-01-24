@@ -5,7 +5,6 @@ import sys
 import json
 import logging
 import argparse
-from isort import stream
 import requests
 from dataclasses import dataclass
 
