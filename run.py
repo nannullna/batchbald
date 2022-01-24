@@ -1,4 +1,4 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from collections import defaultdict
 import os
 import sys
@@ -98,13 +98,16 @@ def get_sampler(name: str):
     elif name.lower() == "bald":
         return BALD
 
-def log_metrics(prefix: str, metrics: Dict[str, Any]) -> Dict[str, Any]:
+def log_metrics(prefix: str, metrics: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+    _metrics = {}
     for k in list(metrics.keys()):
         if not k.startswith(f"{prefix}/"):
-            metrics[f"{prefix}/{k}"] = metrics.pop(k)
-    # wandb
-    wandb.log(metrics)
-    return metrics
+            _metrics[f"{prefix}/{k}"] = metrics[k]
+        else:
+            _metrics[k] = metrics[k]
+    _metrics.update(kwargs)
+    wandb.log(_metrics)
+    return _metrics
 
 def calc_entropy(p: np.ndarray):
     v = p * np.log(p)
@@ -147,6 +150,7 @@ def main(args):
         logger.info(f"Start stage {stage}")
         run_summary = {"stage": stage}
         
+        num_acquired_points = len(pool.get_labeled_ids)
         labeled_dl = pool.get_labeled_dataloader()
 
         model = get_model(num_classes=num_classes).to(device)
@@ -195,8 +199,8 @@ def main(args):
                 break
         pbar.close()
         
-        train_stats = {"accuracy": acc, "epochs": epochs, "steps": steps}
-        train_stats = log_metrics("train", train_stats)
+        train_stats = {"train/accuracy": acc, "train/epochs": epochs, "train/steps": steps}
+        log_metrics("train", train_stats, global_stage=stage, num_acquired=num_acquired_points)
         run_summary.update(train_stats)
         
         all_targets = []
@@ -217,16 +221,16 @@ def main(args):
         
         acc = accuracy_score(all_targets, all_preds)
         
-        test_stats = {"accuracy": acc}
-        test_stats = log_metrics("test", test_stats)
+        test_stats = {"test/accuracy": acc}
         run_summary.update(test_stats)
+        log_metrics("test", test_stats, global_stage=stage, num_acquired=num_acquired_points)
 
         logger.info("Query on unlabeled pool")
         result = sampler()
         query_stats = {
-            "length": len(result.indices), 
-            "time": result.info["time"], 
-            "target_ids": result.indices, 
+            "query/length": len(result.indices), 
+            "query/time": result.info["time"], 
+            "query/target_ids": result.indices, 
         }
         
         # Analyze the query
@@ -241,12 +245,12 @@ def main(args):
         _, cnt = np.unique(query_targets, return_counts=True)
         freq = cnt / np.sum(cnt)
         query_stats.update({
-            "hist_targets": wandb.Histogram(np_histogram=np.histogram(query_targets, bins=bins)),
-            "hist_scores":  wandb.Histogram(np_histogram=np.histogram(result.scores)),
-            "entropy": calc_entropy(freq),
+            "query/hist_targets": wandb.Histogram(np_histogram=np.histogram(query_targets, bins=bins)),
+            "query/hist_scores":  wandb.Histogram(np_histogram=np.histogram(result.scores)),
+            "query/entropy": calc_entropy(freq),
         })
-        query_stats = log_metrics("query", query_stats)
         run_summary.update(query_stats)
+        log_metrics("query", query_stats, global_stage=stage, num_acquired=num_acquired_points)
 
         pool.update(result)
         logging.info(f"Labeled pool updated with size {len(result.indices)}, time consumed {result.info['time']:.1f}s")

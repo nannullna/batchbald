@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Subset
 
+from tqdm.auto import tqdm
+
 from pool import ActivePool
 from utils import QueryResult
 
@@ -89,11 +91,15 @@ class UncertaintySampling(ActiveQuery):
 
         self.model.eval()
         with torch.no_grad():
-            for X, _ in dataloader:
+            for X, _ in tqdm(dataloader, desc="Query by smallest maximum probabilities"):
                 X = X.to(device)
                 # y = y.to(device)
                 out = self.model(X)
-                score, pred = torch.max(out, dim=1)
+
+                # Actually, it is not required to apply softmax...
+                # but it is due to the analysis purpose.
+                prob = torch.softmax(out, dim=1)
+                score, pred = torch.max(prob, dim=1)
                 all_scores.extend(score.detach().cpu().tolist())
 
         # returns the query with the k least confident probability
@@ -108,7 +114,7 @@ class MarginSampling(ActiveQuery):
 
         self.model.eval()
         with torch.no_grad():
-            for X, _ in dataloader:
+            for X, _ in tqdm(dataloader, desc="Query by smallest margins"):
                 X = X.to(device)
                 # y = y.to(device)
                 out = self.model(X)
@@ -130,7 +136,7 @@ class EntropySampling(ActiveQuery):
         else:
             entry = x * torch.log(x)
             entry[x == 0.0] = 0.0
-        entropy = -torch.sum(x, dim=1, keepdim=keepdim)
+        entropy = -torch.sum(entry, dim=1, keepdim=keepdim)
         return entropy
 
     def _query_impl(self, size: int, **kwargs) -> QueryResult:
@@ -141,16 +147,36 @@ class EntropySampling(ActiveQuery):
 
         self.model.eval()
         with torch.no_grad():
-            for X, _ in dataloader:
+            for X, _ in tqdm(dataloader, desc="Query by largest entropies"):
                 X = X.to(device)
                 # y = y.to(device)
                 out = self.model(X)
-                logits = torch.log_softmax(out, dim=1)
-                score = self.calc_entropy(logits, log_p=True)
+                log_prob = torch.softmax(out, dim=1)
+                score = self.calc_entropy(log_prob, log_p=True)
                 all_scores.extend(score.detach().cpu().tolist())
         
         # returns the query with the k highest entropies
         return self.get_query_from_scores(all_scores, size=size, higher_is_better=True)
+
+class GeometricMeanSampling(ActiveQuery):
+    def _query_impl(self, size: int, **kwargs) -> QueryResult:
+        dataloader = self.pool.get_unlabeled_dataloader(shuffle=False)
+        all_scores = []
+
+        device = self.device or torch.device("cuda")
+
+        self.model.eval()
+        with torch.no_grad():
+            for X, _ in tqdm(dataloader, desc="Query by geometric means"):
+                X = X.to(device)
+                # y = y.to(device)
+                out = self.model(X)
+                log_prob = torch.log_softmax(out, dim=1)
+                score = torch.exp(-torch.mean(log_prob, dim=1))
+                all_scores.extend(score.detach().cpu().tolist())
+
+        return self.get_query_from_scores(all_scores, higher_is_better=True)
+
 
 class BALD(ActiveQuery):
 
@@ -162,9 +188,7 @@ class BALD(ActiveQuery):
         self.K = num_samples
 
     def update_model(self, model: nn.Module):
-        del self.model
-        gc.collect()
-        self.model = model
+        super().update_model(model)
         # add dropout right before the final layer
         self.model.global_pool.register_forward_hook(lambda m, i, out: torch.dropout(out, p=0.5, train=True))
 
@@ -172,7 +196,7 @@ class BALD(ActiveQuery):
     def calc_entropy(x: torch.Tensor, log_p: bool = False, keepdim: bool = False) -> torch.Tensor:
         # reduce dimension
         if log_p:
-            mean_log_prob = torch.logsumexp(x, dim=1) - torch.log(torch.tensor(x.size(1)))
+            mean_log_prob = torch.logsumexp(x, dim=1) - math.log(x.size(1))
             entry = torch.exp(mean_log_prob) * mean_log_prob
         else:
             mean_prob = torch.mean(x, dim=1)
@@ -188,7 +212,7 @@ class BALD(ActiveQuery):
         else:
             entry = x * torch.log(x)
             entry[x == 0.0] = 0.0
-        entropy = torch.sum(entry, dim=-1)
+        entropy = -torch.sum(entry, dim=-1)
         entropy = torch.mean(entropy, dim=1, keepdim=keepdim)
         return entropy
 
@@ -205,7 +229,7 @@ class BALD(ActiveQuery):
 
         self.model.train()
         with torch.no_grad():
-            for X, _ in dataloader:
+            for X, _ in tqdm(dataloader):
                 B = X.size(0)
                 in_shape = list(X.shape)[1:]
 
@@ -216,10 +240,56 @@ class BALD(ActiveQuery):
 
                 out = self.model(X)
                 out_shape = list(out.shape)[1:]
-                logits = torch.log_softmax(out, dim=1)
-                logits = logits.view([B, self.K] + out_shape)
+                log_prob = torch.log_softmax(out, dim=1)
+                log_prob = log_prob.view([B, self.K] + out_shape)
 
-                score = self.calc_entropy(logits, log_p=True) - self.calc_conditional_entropy(logits, log_p=True)
+                score = self.calc_entropy(log_prob, log_p=True) - self.calc_conditional_entropy(log_prob, log_p=True)
                 all_scores.extend(score.detach().cpu().tolist())
 
         return self.get_query_from_scores(all_scores, size=size, higher_is_better=True)
+
+
+class BatchBALD(ActiveQuery):
+
+    def __init__(self, model: nn.Module, pool: ActivePool, num_samples: int = 10, size: int = 1, device: torch.device = None):
+        super().__init__(model, pool, size, device)
+        if isinstance(model, nn.Module):
+            # safety check here!
+            self.model.global_pool.register_forward_hook(lambda m, i, out: torch.dropout(out, p=0.5, training=True))
+        self.K = num_samples
+
+    def update_model(self, model: nn.Module):
+        super().update_model(model)
+        # add dropout right before the final layer
+        self.model.global_pool.register_forward_hook(lambda m, i, out: torch.dropout(out, p=0.5, train=True))
+
+    def _query_impl(self, size: int, **kwargs) -> QueryResult:
+
+        _batch_size = self.pool.batch_size//self.K
+        _batch_size = 2**(math.ceil(math.log(_batch_size, 2)))
+
+        dataloader = self.pool.get_unlabeled_dataloader(batch_size=_batch_size)
+        all_scores = []
+
+        device = self.device or torch.device("cuda")
+
+        self.model.train()
+        with torch.no_grad():
+            for X, _ in tqdm(dataloader):
+                B = X.size(0)
+                in_shape = list(X.shape)[1:]
+
+                # create batch input
+                X = X.to(device).unsqueeze(1) # [B, ...]
+                X = X.expand([-1, self.K] + in_shape).contiguous() # [B, K, ...]
+                X = X.view([B*self.K] + in_shape) # [B*K, ...]
+
+                out = self.model(X)
+                out_shape = list(out.shape)[1:]
+                log_prob = torch.log_softmax(out, dim=1)
+                log_prob = log_prob.view([B, self.K] + out_shape)
+
+                score = self.calc_entropy(log_prob, log_p=True) - self.calc_conditional_entropy(log_prob, log_p=True)
+                all_scores.extend(score.detach().cpu().tolist())
+
+        return super()._query_impl(size, **kwargs)
