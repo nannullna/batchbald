@@ -1,3 +1,4 @@
+from email.policy import default
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
 import os
@@ -36,7 +37,7 @@ import wandb
 from tqdm.auto import tqdm
 
 from pool import ActivePool
-from methods import BALD, ActiveQuery, EntropySampling, RandomSampling, UncertaintySampling, MarginSampling
+from methods import BALD, ActiveQuery, BatchBALD, EntropySampling, GeometricMeanSampling, GradientSampling, RandomSampling, UncertaintySampling, MarginSampling
 from models import MNISTCNN
 from utils import QueryResult, set_all_seeds
 
@@ -54,32 +55,40 @@ file_handler.setLevel(logging.DEBUG)
 stream_handler.setFormatter(formatter)
 file_handler.setFormatter(formatter)
 
+logger.addHandler(stream_handler)
+logger.addHandler(file_handler)
+
 def load_dataset(name: str):
-    train_transform = T.Compose([
-        T.ToTensor(), 
-        T.RandomHorizontalFlip(0.5), 
-        T.RandomRotation((-10, 10))
+
+    normalize = T.Compose([
+        T.ToTensor(),
+        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
-    test_transform  = T.Compose([T.ToTensor()])
+    train_augment= T.Compose([ 
+        T.RandomHorizontalFlip(),
+        T.RandomRotation((-15, 15)),
+        T.RandomCrop(32, padding=4),
+        T.RandomErasing(p=0.2),
+#        T.ColorJitter(0.2, 0.2, 0.2, 0.3),
+    ])
 
     if name.lower() == "mnist":
         train_set = MNIST(root="/opt/datasets/mnist", train=True,  transform=T.ToTensor(), download=True)
         test_set  = MNIST(root="/opt/datasets/mnist", train=False, transform=T.ToTensor(), download=True)
 
     elif name.lower() == "cifar10":
-        train_set = CIFAR10(root="/opt/datasets/cifar10", train=True,  transform=train_transform, download=True)
-        test_set  = CIFAR10(root="/opt/datasets/cifar10", train=False, transform=test_transform,  download=True)
-        print(f"lenght of train set {len(train_set)}, test set {len(test_set)}")
+        train_set = CIFAR10(root="/opt/datasets/cifar10", train=True,  transform=T.Compose([normalize, train_augment]), download=True)
+        test_set  = CIFAR10(root="/opt/datasets/cifar10", train=False, transform=normalize, download=True)
 
     elif name.lower() == "cifar100":
         test_transform  = T.Compose([T.ToTensor()])
-        train_set = CIFAR10(root="/opt/datasets/cifar100", train=True,  transform=train_transform, download=True)
-        test_set  = CIFAR10(root="/opt/datasets/cifar100", train=False, transform=test_transform, download=True)
-        print(f"lenght of train set {len(train_set)}, test set {len(test_set)}")
-
+        train_set = CIFAR10(root="/opt/datasets/cifar100", train=True,  transform=T.Compose([normalize, train_augment]), download=True)
+        test_set  = CIFAR10(root="/opt/datasets/cifar100", train=False, transform=normalize, download=True)
+    
     else:
         raise ValueError("Not a proper dataset name")
 
+    logger.info(f"length of train set {len(train_set)}, test set {len(test_set)}")
     return train_set, test_set
 
 def get_model(num_classes:int):
@@ -93,10 +102,16 @@ def get_sampler(name: str):
         return UncertaintySampling
     elif name.lower() == "margin":
         return MarginSampling
+    elif name.lower() == "mean":
+        return GeometricMeanSampling
     elif name.lower() == "entropy":
         return EntropySampling
     elif name.lower() == "bald":
         return BALD
+    elif name.lower() == "batchbald":
+        return BatchBALD
+    elif name.lower() == "gradient":
+        return GradientSampling
 
 def log_metrics(prefix: str, metrics: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     _metrics = {}
@@ -107,6 +122,7 @@ def log_metrics(prefix: str, metrics: Dict[str, Any], **kwargs) -> Dict[str, Any
             _metrics[k] = metrics[k]
     _metrics.update(kwargs)
     wandb.log(_metrics)
+    logger.info(_metrics)
     return _metrics
 
 def calc_entropy(p: np.ndarray):
@@ -133,8 +149,16 @@ def main(args):
     test_dl = DataLoader(test_set, batch_size=args.batch_size, shuffle=False)
 
     num_classes = len(train_set.classes)
-    num_stages = int(len(train_set) * (1-args.initial_label_rate)) // args.query_size
-    max_steps  = (len(train_set) // args.batch_size) * args.max_epochs
+    num_stages  = int(len(train_set) * (1-args.initial_label_rate)) // args.query_size
+    max_steps   = (len(train_set) // args.batch_size) * args.max_epochs
+    log_every   = 10
+    logger.info(f"num_classes: {num_classes}, num_stages: {num_stages}, max_steps: {max_steps}")
+
+    model = get_model(num_classes=num_classes).to(device)
+    if args.query_type.lower() == "bald":
+        model.global_pool.register_forward_hook(lambda m, i, out: torch.dropout(out, p=0.5, train=True))
+    model.init_weights()
+    wandb.watch(model, log='all')
 
     pool = ActivePool(train_set, batch_size=args.batch_size)
     init_sampler = RandomSampling(None, pool, int(len(train_set)*args.initial_label_rate))
@@ -153,12 +177,27 @@ def main(args):
         num_acquired_points = len(pool.get_labeled_ids())
         labeled_dl = pool.get_labeled_dataloader()
 
-        model = get_model(num_classes=num_classes).to(device)
-        sampler.update_model(model)
-        wandb.watch(model, log='all')
+        # simply re-initialize weights to continuously track the model's parameters and gradients
+        model.init_weights()
+        logger.info("Model re-initialized")
+        # sampler.update_model(model)
 
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.SGD(model.parameters(), lr=1e-3, momentum=0.9, weight_decay=0.01)
+
+        # No weight decay for bias and LayerNorm
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": args.weight_decay,
+            },
+            {
+                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = optim.SGD(optimizer_grouped_parameters, lr=args.learning_rate, momentum=args.momentum)
+        # reset optimizer for emptying its state dict
 
         epochs = 0
         steps = 0
@@ -171,7 +210,7 @@ def main(args):
             all_losses  = []
 
             model.train()
-            for X, y in labeled_dl:
+            for batch_idx, (X, y) in enumerate(labeled_dl):
                 optimizer.zero_grad()
 
                 X = X.to(device)
@@ -188,18 +227,23 @@ def main(args):
                 all_losses.append(loss.item())
 
                 steps += 1
-                pbar.update(1)
-                if steps > max_steps:
-                    training = False
-                    break
+                pbar.update(1)                    
             
             acc = accuracy_score(all_targets, all_preds)
             loss = np.mean(all_losses)
+            if (epochs+1) % log_every == 0:
+                log_metrics("training", {"loss": loss, "accuracy": acc, "epoch": epochs}, global_stage=stage)
 
             epochs += 1
             if acc > args.early_stopping_threshold:
-                logger.info(f"Early stopped at epoch {epochs+1} with accuracy score {acc:.3f}")
+                logger.info(f"Early stopped at epoch {epochs} with accuracy score {acc:.3f}")
                 break
+
+            if steps > max_steps:
+                logger.info(f"Stopped as it reached the max steps {max_steps} with accuracy score {acc:.3f}")
+                training = False
+                break
+
         pbar.close()
         
         train_stats = {"train/accuracy": acc, "train/epochs": epochs, "train/steps": steps, "train/loss": loss}
@@ -286,6 +330,10 @@ if __name__ == '__main__':
     parser.add_argument('--max_epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--early_stopping_threshold', type=float, default=0.9)
+
+    parser.add_argument('--learning_rate', type=float, default=1e-3)
+    parser.add_argument('--momentum', type=float, default=0.9)
+    parser.add_argument('--weight_decay', type=float, default=0.01)
 
     parser.add_argument('--query_size', type=int, default=100)
     parser.add_argument('--query_type', type=str, default="random")

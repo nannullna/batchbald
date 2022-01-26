@@ -172,10 +172,10 @@ class GeometricMeanSampling(ActiveQuery):
                 # y = y.to(device)
                 out = self.model(X)
                 log_prob = torch.log_softmax(out, dim=1)
-                score = torch.exp(-torch.mean(log_prob, dim=1))
+                score = torch.exp(torch.mean(log_prob, dim=1))
                 all_scores.extend(score.detach().cpu().tolist())
 
-        return self.get_query_from_scores(all_scores, higher_is_better=True)
+        return self.get_query_from_scores(all_scores, size=size, higher_is_better=True)
 
 
 class BALD(ActiveQuery):
@@ -227,7 +227,7 @@ class BALD(ActiveQuery):
 
         device = self.device or torch.device("cuda")
 
-        self.model.train()
+        self.model.eval()
         with torch.no_grad():
             for X, _ in tqdm(dataloader):
                 B = X.size(0)
