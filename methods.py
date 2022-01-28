@@ -18,7 +18,7 @@ from utils import QueryResult
 
 class ActiveQuery:
     """An abstract class for deep active learning"""
-    def __init__(self, model: nn.Module, pool: ActivePool, size: int=1, device: torch.device=None):
+    def __init__(self, model: nn.Module, pool: ActivePool, size: int=1, device: torch.device=None, **kwargs):
         self.model = model
         self.pool = pool
         self.size = size
@@ -180,17 +180,22 @@ class GeometricMeanSampling(ActiveQuery):
 
 class BALD(ActiveQuery):
 
-    def __init__(self, model: nn.Module, pool: ActivePool, num_samples: int = 10, size: int = 1, device: torch.device = None):
-        super().__init__(model, pool, size, device)
-        if isinstance(model, nn.Module):
-            # safety check here!
-            self.model.global_pool.register_forward_hook(lambda m, i, out: torch.dropout(out, p=0.5, training=True))
-        self.K = num_samples
+    def __init__(self, model: nn.Module, pool: ActivePool, size: int = 1, device: torch.device = None, **kwargs):
+        super().__init__(model, pool, size, device, **kwargs)
+        if "num_samples" in kwargs:
+            self.K = kwargs["num_samples"]
+        elif "K" in kwargs:
+            self.K = kwargs["K"]
+        else:
+            self.K = 10
+
+        if self.model is not None:
+            self.model.global_pool.register_forward_hook(lambda m, i, out: torch.dropout(out, p=0.5, train=True))
 
     def update_model(self, model: nn.Module):
         super().update_model(model)
-        # add dropout right before the final layer
-        self.model.global_pool.register_forward_hook(lambda m, i, out: torch.dropout(out, p=0.5, train=True))
+        if self.model is not None:
+            self.model.global_pool.register_forward_hook(lambda m, i, out: torch.dropout(out, p=0.5, train=True))
 
     @staticmethod
     def calc_entropy(x: torch.Tensor, log_p: bool = False, keepdim: bool = False) -> torch.Tensor:
@@ -201,7 +206,7 @@ class BALD(ActiveQuery):
         else:
             mean_prob = torch.mean(x, dim=1)
             entry = mean_prob * torch.log(mean_prob)
-            entry[mean_prob == 0.0] = 0.0
+            entry[mean_prob == 0.0] = torch.tensor(0.0)
         entropy = -torch.sum(entry, dim=1, keepdim=keepdim)
         return entropy
 
@@ -211,7 +216,7 @@ class BALD(ActiveQuery):
             entry = torch.exp(x) * x
         else:
             entry = x * torch.log(x)
-            entry[x == 0.0] = 0.0
+            entry[x == 0.0] = torch.tensor(0.0)
         entropy = -torch.sum(entry, dim=-1)
         entropy = torch.mean(entropy, dim=1, keepdim=keepdim)
         return entropy
@@ -229,7 +234,7 @@ class BALD(ActiveQuery):
 
         self.model.eval()
         with torch.no_grad():
-            for X, _ in tqdm(dataloader):
+            for X, _ in tqdm(dataloader, desc="Query by mutual information"):
                 B = X.size(0)
                 in_shape = list(X.shape)[1:]
 

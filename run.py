@@ -44,52 +44,45 @@ from utils import QueryResult, set_all_seeds
 # Global logger settings
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-stream_handler = logging.StreamHandler(sys.stdout)
-file_handler = logging.FileHandler(filename="log.txt")
 
-formatter = logging.Formatter(fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+mean = [0.4915, 0.4823, 0.4468]
+std  = [0.2470, 0.2435, 0.2616]
 
-stream_handler.setLevel(logging.INFO)
-file_handler.setLevel(logging.DEBUG)
-
-stream_handler.setFormatter(formatter)
-file_handler.setFormatter(formatter)
-
-logger.addHandler(stream_handler)
-logger.addHandler(file_handler)
+inv_mean = [-mean[i]/std[i] for i in range(3)]
+inv_std  = [1.0/std[i] for i in range(3)]
 
 def load_dataset(name: str):
 
     normalize = T.Compose([
         T.ToTensor(),
-        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        T.Normalize(mean=mean, std=std),
     ])
     train_augment= T.Compose([ 
         T.RandomHorizontalFlip(),
         T.RandomRotation((-15, 15)),
         T.RandomCrop(32, padding=4),
-        T.RandomErasing(p=0.2),
-#        T.ColorJitter(0.2, 0.2, 0.2, 0.3),
     ])
 
     if name.lower() == "mnist":
         train_set = MNIST(root="/opt/datasets/mnist", train=True,  transform=T.ToTensor(), download=True)
+        query_set = train_set
         test_set  = MNIST(root="/opt/datasets/mnist", train=False, transform=T.ToTensor(), download=True)
 
     elif name.lower() == "cifar10":
         train_set = CIFAR10(root="/opt/datasets/cifar10", train=True,  transform=T.Compose([normalize, train_augment]), download=True)
+        query_set = CIFAR10(root="/opt/datasets/cifar10", train=True,  transform=normalize, download=True)
         test_set  = CIFAR10(root="/opt/datasets/cifar10", train=False, transform=normalize, download=True)
 
     elif name.lower() == "cifar100":
-        test_transform  = T.Compose([T.ToTensor()])
         train_set = CIFAR10(root="/opt/datasets/cifar100", train=True,  transform=T.Compose([normalize, train_augment]), download=True)
+        query_set = CIFAR10(root="/opt/datasets/cifar100", train=True,  transform=normalize, download=True)
         test_set  = CIFAR10(root="/opt/datasets/cifar100", train=False, transform=normalize, download=True)
     
     else:
         raise ValueError("Not a proper dataset name")
 
     logger.info(f"length of train set {len(train_set)}, test set {len(test_set)}")
-    return train_set, test_set
+    return train_set, test_set, query_set
 
 def get_model(num_classes:int):
     model = timm.create_model("resnet18", pretrained=False, num_classes=num_classes)
@@ -132,6 +125,15 @@ def calc_entropy(p: np.ndarray):
 
 def main(args):
 
+    stream_handler = logging.StreamHandler(sys.stdout)
+    file_handler = logging.FileHandler(filename=f"{args.run_name}_{args.query_type}_{args.dataset}.log")
+
+    stream_handler.setLevel(logging.INFO)
+    file_handler.setLevel(logging.DEBUG)
+
+    logger.addHandler(stream_handler)
+    logger.addHandler(file_handler)
+
     if args.seed is not None:
         set_all_seeds(args.seed)
 
@@ -145,24 +147,22 @@ def main(args):
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu") 
 
-    train_set, test_set = load_dataset(args.dataset)
+    train_set, test_set, query_set = load_dataset(args.dataset)
     test_dl = DataLoader(test_set, batch_size=args.batch_size, shuffle=False)
 
     num_classes = len(train_set.classes)
     num_stages  = int(len(train_set) * (1-args.initial_label_rate)) // args.query_size
     max_steps   = (len(train_set) // args.batch_size) * args.max_epochs
-    log_every   = 10
+    log_every   = 100
     logger.info(f"num_classes: {num_classes}, num_stages: {num_stages}, max_steps: {max_steps}")
 
     model = get_model(num_classes=num_classes).to(device)
-    if args.query_type.lower() == "bald":
-        model.global_pool.register_forward_hook(lambda m, i, out: torch.dropout(out, p=0.5, train=True))
     model.init_weights()
     wandb.watch(model, log='all')
 
     pool = ActivePool(train_set, batch_size=args.batch_size)
     init_sampler = RandomSampling(None, pool, int(len(train_set)*args.initial_label_rate))
-    sampler = get_sampler(args.query_type)(None, pool, size=args.query_size, device=device)
+    sampler = get_sampler(args.query_type)(model, pool, size=args.query_size, device=device)
 
     init_samples = init_sampler()
     pool.update(init_samples)
@@ -196,7 +196,13 @@ def main(args):
                 "weight_decay": 0.0,
             },
         ]
-        optimizer = optim.SGD(optimizer_grouped_parameters, lr=args.learning_rate, momentum=args.momentum)
+        optimizer = optim.SGD(
+            optimizer_grouped_parameters, 
+            lr=args.learning_rate, 
+            momentum=args.momentum, 
+            weight_decay=args.weight_decay,
+        )
+ #       scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
         # reset optimizer for emptying its state dict
 
         epochs = 0
@@ -230,9 +236,10 @@ def main(args):
                 pbar.update(1)                    
             
             acc = accuracy_score(all_targets, all_preds)
+            f1  = f1_score(all_targets, all_preds, average="weighted")
             loss = np.mean(all_losses)
             if (epochs+1) % log_every == 0:
-                log_metrics("training", {"loss": loss, "accuracy": acc, "epoch": epochs}, global_stage=stage)
+                log_metrics("training", {"loss": loss, "accuracy": acc, "f1": f1, "epoch": epochs}, global_stage=stage)
 
             epochs += 1
             if acc > args.early_stopping_threshold:
@@ -244,9 +251,11 @@ def main(args):
                 training = False
                 break
 
+            # scheduler.step()
+
         pbar.close()
         
-        train_stats = {"train/accuracy": acc, "train/epochs": epochs, "train/steps": steps, "train/loss": loss}
+        train_stats = {"train/accuracy": acc, "train/f1": f1, "train/epochs": epochs, "train/steps": steps, "train/loss": loss}
         log_metrics("train", train_stats, global_stage=stage, num_acquired=num_acquired_points)
         run_summary.update(train_stats)
         
@@ -269,9 +278,10 @@ def main(args):
                 all_losses.append(loss.item())
         
         acc = accuracy_score(all_targets, all_preds)
+        f1  = f1_score(all_targets, all_preds, average="weighted")
         loss = np.mean(all_losses)
         
-        test_stats = {"test/accuracy": acc, "test/loss": loss}
+        test_stats = {"test/accuracy": acc, "test/f1": f1, "test/loss": loss}
         run_summary.update(test_stats)
         log_metrics("test", test_stats, global_stage=stage, num_acquired=num_acquired_points)
 
@@ -289,12 +299,28 @@ def main(args):
         unlabeled_targets = np.asarray(unlabeled_targets)
         query_targets     = unlabeled_targets[result.indices]
 
+        # TODO: Log query images
+        unlabeled_ids = pool.get_unlabeled_ids()
+        inv_transform = T.Compose([
+            T.Normalize(mean=inv_mean, std=inv_std),
+            T.ToPILImage(),
+        ])
+
+        imgs = []
+        labels = []
+        for i in range(32):
+            original_idx = unlabeled_ids[result.indices[i]]
+            img, lbl = query_set[original_idx]
+            imgs.append(inv_transform(img))
+            labels.append(train_set.classes[lbl])
+        
         # Draw a histogram of the query samples
         bins = np.arange(0, num_classes+1) if num_classes < wandb.Histogram.MAX_LENGTH else wandb.Histogram.MAX_LENGTH
 
         _, cnt = np.unique(query_targets, return_counts=True)
         freq = cnt / np.sum(cnt)
         query_stats.update({
+            "query/query_images": [wandb.Image(img, caption=lbl) for img, lbl in zip(imgs, labels)],
             "query/hist_targets": wandb.Histogram(np_histogram=np.histogram(query_targets, bins=bins)),
             "query/hist_scores":  wandb.Histogram(np_histogram=np.histogram(result.scores)),
             "query/entropy": calc_entropy(freq),
@@ -307,7 +333,7 @@ def main(args):
         logging.info(pool)
         
         # not possible to log wandb objects in json
-        ignore_list = ["query/hist_targets", "query/hist_scores"]
+        ignore_list = ["query/hist_targets", "query/hist_scores", "query/query_images"]
         json_summary = {k: v for k, v in run_summary.items() if k not in ignore_list}
         summaries.append(json_summary)
 
@@ -333,11 +359,12 @@ if __name__ == '__main__':
 
     parser.add_argument('--learning_rate', type=float, default=1e-3)
     parser.add_argument('--momentum', type=float, default=0.9)
-    parser.add_argument('--weight_decay', type=float, default=0.01)
+    parser.add_argument('--weight_decay', type=float, default=0.001)
 
     parser.add_argument('--query_size', type=int, default=100)
     parser.add_argument('--query_type', type=str, default="random")
     parser.add_argument('--initial_label_rate', type=float, default=0.1)
+    parser.add_argument('--exclude_ratio', type=float, default=0.0)
 
     parser.add_argument('--wandb_project', type=str, default="active_learning")
 

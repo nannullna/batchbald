@@ -15,14 +15,17 @@ class ActivePool:
         dataset: Dataset,
         batch_size: int = 1,
         labeled_ids: Optional[List[int]] = None,
+        query_set: Optional[Dataset] = None,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
+        self.query_set = query_set or self.dataset
         
         labeled_ids = list(labeled_ids) if labeled_ids else []
 
         self.labeled_data   = Subset(self.dataset, labeled_ids)
-        self.unlabeled_data = Subset(self.dataset, self.reverse_ids(labeled_ids))
+        self.unlabeled_data = Subset(self.query_set, self.reverse_ids(labeled_ids))
+        # query_set is expected not to apply augmentations for better uncertainty estimations and query results
 
     def __repr__(self):
         result = "[Active Pool]\n"
