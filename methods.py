@@ -6,6 +6,7 @@ import math
 import time
 
 import numpy as np
+from sklearn import cluster
 
 import torch
 import torch.nn as nn
@@ -151,7 +152,7 @@ class EntropySampling(ActiveQuery):
                 X = X.to(device)
                 # y = y.to(device)
                 out = self.model(X)
-                log_prob = torch.softmax(out, dim=1)
+                log_prob = torch.log_softmax(out, dim=1)
                 score = self.calc_entropy(log_prob, log_p=True)
                 all_scores.extend(score.detach().cpu().tolist())
         
@@ -167,7 +168,7 @@ class GeometricMeanSampling(ActiveQuery):
 
         self.model.eval()
         with torch.no_grad():
-            for X, _ in tqdm(dataloader, desc="Query by geometric means"):
+            for X, _ in tqdm(dataloader, desc="Query by largest geometric means"):
                 X = X.to(device)
                 # y = y.to(device)
                 out = self.model(X)
@@ -206,7 +207,7 @@ class BALD(ActiveQuery):
         else:
             mean_prob = torch.mean(x, dim=1)
             entry = mean_prob * torch.log(mean_prob)
-            entry[mean_prob == 0.0] = torch.tensor(0.0)
+            entry[mean_prob == 0.0] = 0.0
         entropy = -torch.sum(entry, dim=1, keepdim=keepdim)
         return entropy
 
@@ -216,7 +217,7 @@ class BALD(ActiveQuery):
             entry = torch.exp(x) * x
         else:
             entry = x * torch.log(x)
-            entry[x == 0.0] = torch.tensor(0.0)
+            entry[x == 0.0] = 0.0
         entropy = -torch.sum(entry, dim=-1)
         entropy = torch.mean(entropy, dim=1, keepdim=keepdim)
         return entropy
@@ -265,3 +266,39 @@ class GradientSampling(ActiveQuery):
 # TODO
 class AdaptiveGradientSampling(ActiveQuery):
     pass
+
+class KMeansSampling(ActiveQuery):
+
+    from sklearn.cluster import KMeans
+
+    def get_embeddings(self) -> torch.Tensor:
+        embeddings = []
+        handle = self.model.global_pool.register_forward_hook(lambda m, i, o: embeddings.append(o.flatten(start_dim=1)))
+        self.model.eval()
+        with torch.no_grad():
+            for X, _ in tqdm(self.pool.get_unlabeled_dataloader(), desc="Query by nearest samples to centroids"):
+                X = X.to(self.device)
+                self.model(X)
+        # prevent memory leaks
+        handle.remove()
+        return torch.cat(embeddings, dim=0)
+
+    def _query_impl(self, size: int, **kwargs) -> QueryResult:
+        embs = self.get_embeddings()
+        embs_arr = embs.detach().cpu().numpy()
+        kmeans = cluster.KMeans(n_clusters=size)
+        kmeans.fit(embs_arr)
+
+        cluster_ids = kmeans.predict(embs_arr)
+        centroids   = kmeans.cluster_centers_[cluster_ids]
+        distances   = (embs_arr - centroids) ** 2
+        distances   = np.sqrt(distances.sum(axis=1))
+
+        torch.cuda.empty_cache()
+        query_ids = [np.arange(embs_arr.shape[0])[cluster_ids==i][distances[cluster_ids==i].argmin()] for i in range(size)]
+        
+        return QueryResult(
+            indices=query_ids, 
+            scores=distances[query_ids].tolist(),
+        )
+        

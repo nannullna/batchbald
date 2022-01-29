@@ -5,6 +5,7 @@ import os
 import sys
 import json
 import logging
+import datetime
 import argparse
 import requests
 from dataclasses import dataclass
@@ -37,7 +38,7 @@ import wandb
 from tqdm.auto import tqdm
 
 from pool import ActivePool
-from methods import BALD, ActiveQuery, BatchBALD, EntropySampling, GeometricMeanSampling, GradientSampling, RandomSampling, UncertaintySampling, MarginSampling
+from methods import BALD, ActiveQuery, BatchBALD, EntropySampling, GeometricMeanSampling, GradientSampling, KMeansSampling, RandomSampling, UncertaintySampling, MarginSampling
 from models import MNISTCNN
 from utils import QueryResult, set_all_seeds
 
@@ -105,6 +106,8 @@ def get_sampler(name: str):
         return BatchBALD
     elif name.lower() == "gradient":
         return GradientSampling
+    elif name.lower() == "kmeans":
+        return KMeansSampling
 
 def log_metrics(prefix: str, metrics: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     _metrics = {}
@@ -125,14 +128,9 @@ def calc_entropy(p: np.ndarray):
 
 def main(args):
 
-    stream_handler = logging.StreamHandler(sys.stdout)
-    file_handler = logging.FileHandler(filename=f"{args.run_name}_{args.query_type}_{args.dataset}.log")
-
-    stream_handler.setLevel(logging.INFO)
-    file_handler.setLevel(logging.DEBUG)
-
-    logger.addHandler(stream_handler)
-    logger.addHandler(file_handler)
+    current_time = datetime.datetime.now().strftime("%y%m%d_%H%M")
+    args.logging_path = os.path.join(args.logging_path, f"{args.run_name}_{current_time}")
+    args.save_path = os.path.join(args.save_path, f"{args.run_name}_{current_time}")
 
     if args.seed is not None:
         set_all_seeds(args.seed)
@@ -145,6 +143,23 @@ def main(args):
         os.makedirs(args.save_path)
         logger.warning(f"Model save path {os.path.abspath(args.save_path)} has been created!")
 
+    log_file_path = os.path.join(args.logging_path, f"{args.run_name}_{args.query_type}_{args.dataset}.log")
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    file_handler = logging.FileHandler(filename=log_file_path)
+    formatter = logging.Formatter("%(asctime)s | %(name)s | %(levelname)s | %(message)s")
+
+    stream_handler.setLevel(logging.INFO)
+    file_handler.setLevel(logging.DEBUG)
+
+    stream_handler.setFormatter(formatter)
+    file_handler.setFormatter(formatter)
+
+    logger.addHandler(stream_handler)
+    logger.addHandler(file_handler)
+
+    "[%(asctime)-15s] (%(filename)s:%(lineno)d) %(name)s:%(levelname)s - %(message)s"
+
     device = torch.device(args.device if torch.cuda.is_available() else "cpu") 
 
     train_set, test_set, query_set = load_dataset(args.dataset)
@@ -153,7 +168,6 @@ def main(args):
     num_classes = len(train_set.classes)
     num_stages  = int(len(train_set) * (1-args.initial_label_rate)) // args.query_size
     max_steps   = (len(train_set) // args.batch_size) * args.max_epochs
-    log_every   = 100
     logger.info(f"num_classes: {num_classes}, num_stages: {num_stages}, max_steps: {max_steps}")
 
     model = get_model(num_classes=num_classes).to(device)
@@ -165,7 +179,10 @@ def main(args):
     sampler = get_sampler(args.query_type)(model, pool, size=args.query_size, device=device)
 
     init_samples = init_sampler()
+    logger.info(f"initial labeled samples: {pool.convert_to_original_ids(init_samples.indices)}")
+
     pool.update(init_samples)
+    print(pool)
 
     summaries = []
 
@@ -238,10 +255,11 @@ def main(args):
             acc = accuracy_score(all_targets, all_preds)
             f1  = f1_score(all_targets, all_preds, average="weighted")
             loss = np.mean(all_losses)
-            if (epochs+1) % log_every == 0:
-                log_metrics("training", {"loss": loss, "accuracy": acc, "f1": f1, "epoch": epochs}, global_stage=stage)
 
             epochs += 1
+            if epochs % args.log_every == 0:
+                log_metrics("training", {"loss": loss, "accuracy": acc, "f1": f1, "epoch": epochs}, global_stage=stage)
+
             if acc > args.early_stopping_threshold:
                 logger.info(f"Early stopped at epoch {epochs} with accuracy score {acc:.3f}")
                 break
@@ -255,7 +273,7 @@ def main(args):
 
         pbar.close()
         
-        train_stats = {"train/accuracy": acc, "train/f1": f1, "train/epochs": epochs, "train/steps": steps, "train/loss": loss}
+        train_stats = {"train/accuracy": acc, "train/weighted_f1": f1, "train/epochs": epochs, "train/steps": steps, "train/loss": loss}
         log_metrics("train", train_stats, global_stage=stage, num_acquired=num_acquired_points)
         run_summary.update(train_stats)
         
@@ -281,26 +299,23 @@ def main(args):
         f1  = f1_score(all_targets, all_preds, average="weighted")
         loss = np.mean(all_losses)
         
-        test_stats = {"test/accuracy": acc, "test/f1": f1, "test/loss": loss}
+        test_stats = {"test/accuracy": acc, "test/weighted_f1": f1, "test/loss": loss}
         run_summary.update(test_stats)
         log_metrics("test", test_stats, global_stage=stage, num_acquired=num_acquired_points)
 
         logger.info("Query on unlabeled pool")
         result = sampler()
+
+        unlabeled_targets = np.asarray(pool.get_unlabeled_targets())
+        query_targets     = unlabeled_targets[result.indices]
+
         query_stats = {
             "query/length": len(result.indices), 
             "query/time": result.info["time"], 
-            "query/target_ids": result.indices, 
+            "query/target_ids": result.indices,
+            "query/original_ids": pool.convert_to_original_ids(result.indices), 
         }
         
-        # Analyze the query
-        # TODO: draw histogram of actual gradients + expected gradients!
-        unlabeled_targets = pool.get_unlabeled_targets()
-        unlabeled_targets = np.asarray(unlabeled_targets)
-        query_targets     = unlabeled_targets[result.indices]
-
-        # TODO: Log query images
-        unlabeled_ids = pool.get_unlabeled_ids()
         inv_transform = T.Compose([
             T.Normalize(mean=inv_mean, std=inv_std),
             T.ToPILImage(),
@@ -308,9 +323,8 @@ def main(args):
 
         imgs = []
         labels = []
-        for i in range(32):
-            original_idx = unlabeled_ids[result.indices[i]]
-            img, lbl = query_set[original_idx]
+        for idx in pool.convert_to_original_ids(result.indices[:50]):
+            img, lbl = query_set[idx]
             imgs.append(inv_transform(img))
             labels.append(train_set.classes[lbl])
         
@@ -331,6 +345,9 @@ def main(args):
         pool.update(result)
         logging.info(f"Labeled pool updated with size {len(result.indices)}, time consumed {result.info['time']:.1f}s")
         logging.info(pool)
+
+        # sanity check
+        assert len(set(pool.get_labeled_ids() + pool.get_unlabeled_ids())) == len(train_set)
         
         # not possible to log wandb objects in json
         ignore_list = ["query/hist_targets", "query/hist_scores", "query/query_images"]
@@ -351,6 +368,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str)
     parser.add_argument('--save_path', type=str, default="./saved")
     parser.add_argument('--logging_path', type=str, default="./logging")
+    parser.add_argument('--log_every', type=int, default=50)
     parser.add_argument('--device', type=str, default="cuda:0")
 
     parser.add_argument('--max_epochs', type=int, default=50)
