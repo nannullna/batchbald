@@ -1,4 +1,4 @@
-from typing import Optional, Union, List, Dict, NoReturn
+from typing import Any, Optional, Union, List, Dict, NoReturn
 import numpy as np
 from torch.utils.data import Dataset, DataLoader, Subset
 from utils import QueryResult
@@ -54,11 +54,29 @@ class ActivePool:
     def get_labeled_ids(self) -> List[int]:
         return self.labeled_data.indices
 
+    def get_classes(self) -> List[Any]:
+        if isinstance(self.dataset, Subset):
+            dataset_ptr = self.dataset.dataset
+        else:
+            dataset_ptr = self.dataset
+        if hasattr(dataset_ptr, "classes"):
+            return dataset_ptr.classes
+        else:
+            return []
+
     def get_unlabeled_targets(self) -> Union[List[int], None]:
-        if hasattr(self.dataset, "targets"):
+        
+        if isinstance(self.dataset, Subset):
+            dataset_ptr = self.dataset.dataset
+        else:
+            dataset_ptr = self.dataset
+
+        if hasattr(dataset_ptr, "targets"):
             # torchvision.datasets (MNIST, CIFAR10, CIFAR100, ...)
-            all_targets = np.asarray(self.dataset.targets)
+            all_targets = np.asarray(dataset_ptr.targets)
             return all_targets[self.get_unlabeled_ids()].tolist()
+        else:
+            return []
 
     def get_labeled_targets(self) -> Union[List[int], None]:
         if hasattr(self.dataset, "targets"):

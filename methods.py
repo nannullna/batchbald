@@ -276,7 +276,7 @@ class KMeansSampling(ActiveQuery):
         handle = self.model.global_pool.register_forward_hook(lambda m, i, o: embeddings.append(o.flatten(start_dim=1)))
         self.model.eval()
         with torch.no_grad():
-            for X, _ in tqdm(self.pool.get_unlabeled_dataloader(), desc="Query by nearest samples to centroids"):
+            for X, _ in tqdm(self.pool.get_unlabeled_dataloader(), desc="Get embeddings"):
                 X = X.to(self.device)
                 self.model(X)
         # prevent memory leaks
@@ -294,6 +294,7 @@ class KMeansSampling(ActiveQuery):
         distances   = (embs_arr - centroids) ** 2
         distances   = np.sqrt(distances.sum(axis=1))
 
+        # prevent memory leaks
         torch.cuda.empty_cache()
         query_ids = [np.arange(embs_arr.shape[0])[cluster_ids==i][distances[cluster_ids==i].argmin()] for i in range(size)]
         
